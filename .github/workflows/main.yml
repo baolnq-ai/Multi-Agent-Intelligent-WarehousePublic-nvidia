@@ -438,7 +438,7 @@ jobs:
           echo "RESULT=$(if [ ${{ job.status }} == 'success' ]; then echo 'PASS'; else echo 'FAIL'; fi)" >> $GITHUB_OUTPUT
    
       - name: Send mail
-        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        uses: dawidd6/action-send-mail@42942bc2f8fba4e611b459a018967a6a7c78c68c
         if: always()
         with:
           server_address: smtp.gmail.com
