@@ -2,6 +2,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 module.exports = function(app) {
   console.log('Setting up proxy middleware...');
+  const apiTarget = process.env.REACT_APP_API_PROXY_TARGET || 'http://localhost:8001';
   
   // Use pathRewrite to add /api prefix back when forwarding
   // Express strips /api when using app.use('/api', ...), so we need to restore it
@@ -13,7 +14,7 @@ module.exports = function(app) {
   app.use(
     '/api',
     createProxyMiddleware({
-      target: 'http://localhost:8001',
+      target: apiTarget,
       changeOrigin: true,
       secure: false,
       logLevel: 'debug',
@@ -41,5 +42,5 @@ module.exports = function(app) {
     })
   );
   
-  console.log('Proxy middleware configured for /api -> http://localhost:8001');
+  console.log(`Proxy middleware configured for /api -> ${apiTarget}`);
 };
