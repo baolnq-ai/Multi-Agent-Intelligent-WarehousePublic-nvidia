@@ -37,6 +37,7 @@ concurrency:
 jobs:
   # Full Stack Deployment - Following DEPLOYMENT.md 13-Step Procedure
   deploy-and-test:
+    if: github.repository_owner == 'NVIDIA-AI-Blueprints'
     #runs-on: ubuntu-latest
     runs-on: arc-runners-org-nvidia-ai-bp-4-gpu
 
