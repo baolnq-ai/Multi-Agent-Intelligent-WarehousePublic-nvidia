@@ -417,7 +417,7 @@ jobs:
 
       - name: Upload MAIW pytest HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: maiw-pytest-report
           path: reports/maiw_test_report.html
@@ -426,7 +426,7 @@ jobs:
 
       - name: Upload production checklist
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-deployment-checklist
           path: production-checklist.md
