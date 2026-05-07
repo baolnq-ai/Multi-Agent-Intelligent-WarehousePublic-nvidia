@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 import json
 from datetime import datetime
+import re
 
 from src.api.services.llm.nim_client import get_nim_client, LLMResponse
 from src.retrieval.hybrid_retriever import get_hybrid_retriever, SearchContext
@@ -242,6 +243,27 @@ class ForecastingAgent:
     ) -> MCPForecastingQuery:
         """Parse the user query to extract intent and entities."""
         try:
+            query_lower = query.lower()
+            entities: Dict[str, Any] = {}
+
+            # Fast path for simple forecasting intents to avoid LLM latency.
+            if any(token in query_lower for token in ["forecast", "demand", "prediction", "predict", "dự báo", "nhu cầu"]):
+                days_match = re.search(r"(\d{1,3})\s{0,5}(?:day|days|ngay|ngày)", query_lower)
+                if days_match:
+                    entities["horizon_days"] = int(days_match.group(1))
+
+                sku_match = re.search(r"\b([A-Z]{3}\d{3})\b", query)
+                if sku_match:
+                    entities["sku"] = sku_match.group(1)
+
+                if len(query.split()) <= 18:
+                    return MCPForecastingQuery(
+                        intent="forecast",
+                        entities=entities,
+                        context=context or {},
+                        user_query=query,
+                    )
+
             # Load prompt from configuration
             if self.config is None:
                 self.config = load_agent_config("forecasting")
@@ -267,8 +289,14 @@ class ForecastingAgent:
                 },
             ]
 
-            llm_response = await self.nim_client.generate_response(parse_prompt)
-            parsed = json.loads(llm_response.content)
+            llm_response = await self.nim_client.generate_response(
+                parse_prompt,
+                temperature=0.0,
+                max_tokens=300,
+                max_retries=1,
+            )
+            raw_content = llm_response.content if isinstance(llm_response.content, str) else ""
+            parsed = json.loads(raw_content) if raw_content else {}
 
             return MCPForecastingQuery(
                 intent=parsed.get("intent", "forecast"),
@@ -331,40 +359,10 @@ class ForecastingAgent:
                 keyword_tools = await self.tool_discovery.search_tools(query.user_query)
                 discovered_tools.extend(keyword_tools)
 
-            # Add direct tools if MCP doesn't have them
+            # Forecasting execution uses direct action tools, so empty discovery is acceptable.
             if not discovered_tools:
-                discovered_tools = [
-                    DiscoveredTool(
-                        name="get_forecast",
-                        description="Get demand forecast for a specific SKU",
-                        category=ToolCategory.FORECASTING,
-                        parameters={"sku": "string", "horizon_days": "integer"},
-                    ),
-                    DiscoveredTool(
-                        name="get_batch_forecast",
-                        description="Get demand forecasts for multiple SKUs",
-                        category=ToolCategory.FORECASTING,
-                        parameters={"skus": "list", "horizon_days": "integer"},
-                    ),
-                    DiscoveredTool(
-                        name="get_reorder_recommendations",
-                        description="Get automated reorder recommendations",
-                        category=ToolCategory.FORECASTING,
-                        parameters={},
-                    ),
-                    DiscoveredTool(
-                        name="get_model_performance",
-                        description="Get model performance metrics",
-                        category=ToolCategory.FORECASTING,
-                        parameters={},
-                    ),
-                    DiscoveredTool(
-                        name="get_forecast_dashboard",
-                        description="Get comprehensive forecasting dashboard",
-                        category=ToolCategory.FORECASTING,
-                        parameters={},
-                    ),
-                ]
+                logger.info("No MCP forecasting tools discovered; continuing with direct forecasting action tools")
+                return []
 
             return discovered_tools
 
@@ -399,26 +397,26 @@ class ForecastingAgent:
                         }
                     )
                 else:
-                    # Batch forecast for multiple SKUs or all
+                    # Batch forecast for a small SKU set to keep latency within chat timeout.
                     skus = entities.get("skus", [])
                     if not skus:
                         # Get all SKUs from inventory
                         from src.retrieval.structured.sql_retriever import SQLRetriever
                         sql_retriever = SQLRetriever()
                         sku_results = await sql_retriever.fetch_all(
-                            "SELECT DISTINCT sku FROM inventory_items ORDER BY sku LIMIT 10"
+                            "SELECT DISTINCT sku FROM inventory_items ORDER BY sku LIMIT 3"
                         )
                         skus = [row["sku"] for row in sku_results]
 
                     forecast = await self.forecasting_tools.get_batch_forecast(
-                        skus, entities.get("horizon_days", 30)
+                        skus, entities.get("horizon_days", 7)
                     )
                     tool_results["batch_forecast"] = forecast
                     actions_taken.append(
                         {
                             "action": "get_batch_forecast",
                             "skus": skus,
-                            "horizon_days": entities.get("horizon_days", 30),
+                            "horizon_days": entities.get("horizon_days", 7),
                         }
                     )
 
@@ -454,6 +452,35 @@ class ForecastingAgent:
 
         return tool_results
 
+    def _build_fast_forecasting_summary(
+        self,
+        parsed_query: MCPForecastingQuery,
+        tool_results: Dict[str, Any],
+    ) -> Optional[str]:
+        """Build a direct natural-language summary from forecasting tool outputs."""
+        if not tool_results or "error" in tool_results:
+            return None
+
+        if "forecast" in tool_results and isinstance(tool_results["forecast"], dict):
+            fc = tool_results["forecast"]
+            sku = fc.get("sku", parsed_query.entities.get("sku", "the requested SKU"))
+            preds = fc.get("predictions", [])
+            days = fc.get("horizon_days", parsed_query.entities.get("horizon_days", 7))
+            if preds:
+                avg = sum(float(x) for x in preds[: min(len(preds), 7)]) / min(len(preds), 7)
+                return f"Forecast generated for {sku} over {days} days. Average expected daily demand is approximately {avg:.2f} units."
+            return f"Forecast generated for {sku} over {days} days."
+
+        if "batch_forecast" in tool_results and isinstance(tool_results["batch_forecast"], dict):
+            batch = tool_results["batch_forecast"]
+            sku_count = len(batch.keys())
+            return f"Forecasts generated for {sku_count} SKU(s) over the requested horizon."
+
+        if "dashboard" in tool_results:
+            return "Forecast dashboard and business intelligence data have been generated successfully."
+
+        return None
+
     async def _generate_response(
         self,
         original_query: str,
@@ -464,6 +491,34 @@ class ForecastingAgent:
     ) -> MCPForecastingResponse:
         """Generate natural language response from tool results."""
         try:
+            fast_summary = self._build_fast_forecasting_summary(parsed_query, tool_results)
+            if fast_summary:
+                confidence = 0.9 if "error" not in tool_results else 0.3
+                reasoning_steps = None
+                if reasoning_chain:
+                    reasoning_steps = [
+                        {
+                            "step_id": step.step_id,
+                            "step_type": step.step_type,
+                            "description": step.description,
+                            "reasoning": step.reasoning,
+                            "confidence": step.confidence,
+                        }
+                        for step in reasoning_chain.steps
+                    ]
+                return MCPForecastingResponse(
+                    response_type=parsed_query.intent,
+                    data=tool_results,
+                    natural_language=fast_summary,
+                    recommendations=[],
+                    confidence=confidence,
+                    actions_taken=parsed_query.tool_execution_plan or [],
+                    mcp_tools_used=[],
+                    tool_execution_results=tool_results,
+                    reasoning_chain=reasoning_chain,
+                    reasoning_steps=reasoning_steps,
+                )
+
             # Format tool results for LLM
             results_summary = json.dumps(tool_results, default=str, indent=2)
 
@@ -496,7 +551,12 @@ class ForecastingAgent:
                 },
             ]
 
-            llm_response = await self.nim_client.generate_response(response_prompt)
+            llm_response = await self.nim_client.generate_response(
+                response_prompt,
+                temperature=0.2,
+                max_tokens=800,
+                max_retries=1,
+            )
             natural_language = llm_response.content
 
             # Extract recommendations

@@ -21,6 +21,7 @@ Loads agent configurations from YAML files in data/config/agents/.
 """
 
 import logging
+import os
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -64,18 +65,29 @@ class AgentConfigLoader:
                        Defaults to data/config/agents/ relative to project root.
         """
         if config_dir is None:
-            # Find project root (look for pyproject.toml or README.md)
-            current = Path(__file__).resolve()
-            project_root = None
-            for parent in [current] + list(current.parents):
-                if (parent / "pyproject.toml").exists() or (parent / "README.md").exists():
-                    project_root = parent
-                    break
-            
-            if project_root is None:
-                raise ValueError("Could not find project root directory")
-            
-            config_dir = project_root / "data" / "config" / "agents"
+            # 1) Explicit override from environment.
+            env_config_dir = os.getenv("AGENT_CONFIG_DIR")
+            if env_config_dir:
+                config_dir = Path(env_config_dir)
+            else:
+                # 2) Find nearest parent containing data/config/agents.
+                current = Path(__file__).resolve()
+                candidates = [Path.cwd(), current] + list(current.parents) + [Path("/app")]
+
+                resolved = None
+                for base in candidates:
+                    candidate = base / "data" / "config" / "agents"
+                    if candidate.exists():
+                        resolved = candidate
+                        break
+
+                if resolved is None:
+                    raise ValueError(
+                        "Could not find agent config directory. "
+                        "Set AGENT_CONFIG_DIR or ensure data/config/agents exists in the runtime image."
+                    )
+
+                config_dir = resolved
         
         self.config_dir = Path(config_dir)
         self._cache: Dict[str, AgentConfig] = {}

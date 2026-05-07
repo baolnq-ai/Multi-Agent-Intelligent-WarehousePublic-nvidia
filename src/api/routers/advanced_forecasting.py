@@ -137,20 +137,28 @@ class AdvancedForecastingService:
     async def initialize(self):
         """Initialize database and Redis connections"""
         try:
+            pg_host = os.getenv("DB_HOST") or os.getenv("PGHOST") or os.getenv("POSTGRES_HOST") or "timescaledb"
+            pg_port = int(os.getenv("DB_PORT") or os.getenv("PGPORT") or os.getenv("POSTGRES_PORT") or "5432")
+            pg_user = os.getenv("POSTGRES_USER", "warehouse")
+            pg_password = os.getenv("POSTGRES_PASSWORD", "")
+            pg_database = os.getenv("POSTGRES_DB", "warehouse")
+
             # PostgreSQL connection
             self.pg_conn = await asyncpg.connect(
-                host="localhost",
-                port=5435,
-                user="warehouse",
-                password=os.getenv("POSTGRES_PASSWORD", ""),
-                database="warehouse"
+                host=pg_host,
+                port=pg_port,
+                user=pg_user,
+                password=pg_password,
+                database=pg_database,
             )
             
             # Set db_pool to pg_conn for compatibility with model performance methods
             self.db_pool = self.pg_conn
             
             # Redis connection for caching
-            self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+            redis_host = os.getenv("REDIS_HOST", "redis")
+            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            self.redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
             
             logger.info("✅ Advanced forecasting service initialized")
         except Exception as e:

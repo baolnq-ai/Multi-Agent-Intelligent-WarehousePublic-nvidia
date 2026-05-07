@@ -26,6 +26,7 @@ from dataclasses import dataclass, asdict
 import json
 from datetime import datetime, timedelta
 import asyncio
+import re
 
 from src.api.services.llm.nim_client import get_nim_client, LLMResponse
 from src.retrieval.hybrid_retriever import get_hybrid_retriever, SearchContext
@@ -296,6 +297,52 @@ class MCPOperationsCoordinationAgent:
     ) -> MCPOperationsQuery:
         """Parse operations query and extract intent and entities."""
         try:
+            # Fast path for simple operations queries to avoid unnecessary LLM latency.
+            query_lower = query.lower()
+            entities: Dict[str, Any] = {}
+            fast_intent = "workforce_management"
+
+            # Lightweight intent detection
+            if any(word in query_lower for word in ["wave", "pick wave", "outbound", "đợt", "tao pick", "tạo pick"]):
+                fast_intent = "wave_creation"
+            elif any(word in query_lower for word in ["dispatch", "forklift", "equipment", "điều xe", "xe nâng"]):
+                fast_intent = "equipment_dispatch"
+            elif any(word in query_lower for word in ["worker", "workers", "workforce", "employee", "staff", "operator", "nhan vien", "nhân viên"]):
+                fast_intent = "workforce_management"
+            elif any(word in query_lower for word in ["assign", "task", "giao viec", "giao việc", "phân công", "phan cong"]):
+                fast_intent = "task_assignment"
+            elif any(word in query_lower for word in ["kpi", "performance", "năng suất", "nang suat", "productivity"]):
+                fast_intent = "kpi_analysis"
+
+            # Entity extraction (best-effort)
+            zone_match = re.search(r"(?:zone|khu)\s+([a-z])", query_lower)
+            if zone_match:
+                entities["zone"] = f"Zone {zone_match.group(1).upper()}"
+
+            order_ids = re.findall(r"\b\d{4,}\b", query)
+            if order_ids:
+                entities["order_ids"] = order_ids[:20]
+
+            if "urgent" in query_lower or "khẩn" in query_lower:
+                entities["priority"] = "high"
+            elif "low" in query_lower:
+                entities["priority"] = "low"
+
+            equipment_match = re.search(r"\b([A-Z]{1,3}-?\d{1,3})\b", query, re.IGNORECASE)
+            if equipment_match:
+                entities["asset_id"] = equipment_match.group(1).upper()
+
+            # Use fast parse for short/clear queries.
+            is_simple_query = len(query.split()) <= 20
+            if is_simple_query and (entities or fast_intent != "workforce_management"):
+                logger.info(f"Using fast keyword-based operations parsing for query: {query[:80]}")
+                return MCPOperationsQuery(
+                    intent=fast_intent,
+                    entities=entities,
+                    context=context or {},
+                    user_query=query,
+                )
+
             # Use LLM to parse the query
             parse_prompt = [
                 {
@@ -324,22 +371,28 @@ Return only valid JSON.""",
                 },
             ]
 
-            response = await self.nim_client.generate_response(parse_prompt)
+            response = await self.nim_client.generate_response(
+                parse_prompt,
+                temperature=0.0,
+                max_tokens=300,
+                max_retries=1,
+            )
 
             # Parse JSON response
             try:
-                parsed_data = json.loads(response.content)
+                raw_content = response.content if isinstance(response.content, str) else ""
+                parsed_data = json.loads(raw_content) if raw_content else {}
             except json.JSONDecodeError:
                 # Fallback parsing
                 parsed_data = {
-                    "intent": "workforce_management",
-                    "entities": {},
+                    "intent": fast_intent,
+                    "entities": entities,
                     "context": {},
                 }
 
             return MCPOperationsQuery(
-                intent=parsed_data.get("intent", "workforce_management"),
-                entities=parsed_data.get("entities", {}),
+                intent=parsed_data.get("intent", fast_intent),
+                entities=parsed_data.get("entities", entities),
                 context=parsed_data.get("context", {}),
                 user_query=query,
             )
@@ -349,8 +402,54 @@ Return only valid JSON.""",
             # Return default query structure on parse failure
             # This allows the system to continue processing even if LLM parsing fails
             return MCPOperationsQuery(
-                intent="workforce_management", entities={}, context={}, user_query=query
+                intent=fast_intent, entities=entities, context=context or {}, user_query=query
             )
+
+    def _build_fast_tool_result_summary(
+        self,
+        query: MCPOperationsQuery,
+        successful_results: Dict[str, Any],
+        failed_results: Dict[str, Any],
+    ) -> Optional[str]:
+        """Build a deterministic natural-language summary from tool outputs.
+
+        This path is used when tool execution already succeeded and avoids slow
+        LLM response synthesis for straightforward operations flows.
+        """
+        if not successful_results:
+            return None
+
+        lines: List[str] = []
+        for tool_result in successful_results.values():
+            tool_name = tool_result.get("tool_name", "")
+            result = tool_result.get("result", {})
+
+            if not isinstance(result, dict):
+                continue
+
+            if tool_name == "create_task" and result.get("task_id"):
+                lines.append(
+                    f"Created task {result.get('task_id')} ({result.get('task_type', 'task')}) in {result.get('zone', 'the requested zone')} with {result.get('priority', 'normal')} priority. Status is {result.get('status', 'queued')}."
+                )
+            elif tool_name == "get_workforce_status":
+                count = result.get("count")
+                if count is None and isinstance(result.get("workforce"), list):
+                    count = len(result.get("workforce", []))
+                if count is not None:
+                    lines.append(f"Found {count} workforce members matching your criteria.")
+            elif tool_name in ["assign_equipment", "dispatch_equipment"]:
+                equipment_id = result.get("equipment_id") or result.get("asset_id") or "the selected equipment"
+                lines.append(
+                    f"Dispatched {equipment_id} for task {result.get('task_id', 'the requested task')} in {result.get('zone', 'the requested zone')}."
+                )
+
+        if not lines:
+            return None
+
+        if failed_results:
+            lines.append(f"{len(failed_results)} action(s) did not complete and may need a retry.")
+
+        return " ".join(lines)
 
     async def _discover_relevant_tools(
         self, query: MCPOperationsQuery
@@ -1003,6 +1102,51 @@ Return only valid JSON.""",
                 for tool_id, result in list(successful_results.items())[:3]:  # Log first 3
                     logger.info(f"  Tool {tool_id} ({result.get('tool_name', 'unknown')}): {str(result.get('result', {}))[:200]}")
 
+            # Fast synthesis path for straightforward tool-driven operations responses.
+            fast_summary = self._build_fast_tool_result_summary(
+                query=query,
+                successful_results=successful_results,
+                failed_results=failed_results,
+            )
+            if fast_summary:
+                total_tools = len(tool_results)
+                successful_count = len(successful_results)
+                success_rate = (successful_count / total_tools) if total_tools else 0.0
+                confidence = 0.95 if success_rate == 1.0 else (0.75 + (success_rate * 0.2))
+
+                reasoning_steps = None
+                if reasoning_chain:
+                    reasoning_steps = [
+                        {
+                            "step_id": step.step_id,
+                            "step_type": step.step_type,
+                            "description": step.description,
+                            "reasoning": step.reasoning,
+                            "confidence": step.confidence,
+                        }
+                        for step in reasoning_chain.steps
+                    ]
+
+                return MCPOperationsResponse(
+                    response_type="operations_info",
+                    data={"results": successful_results, "failed": failed_results},
+                    natural_language=fast_summary,
+                    recommendations=[] if not failed_results else ["Retry failed actions if needed."],
+                    confidence=confidence,
+                    actions_taken=[
+                        {
+                            "action": tool_result.get("tool_name", tool_id),
+                            "status": "success" if tool_result.get("success") else "failed",
+                            "details": tool_result.get("result", {}) if tool_result.get("success") else tool_result.get("error", ""),
+                        }
+                        for tool_id, tool_result in tool_results.items()
+                    ],
+                    mcp_tools_used=list(successful_results.keys()),
+                    tool_execution_results=tool_results,
+                    reasoning_chain=reasoning_chain,
+                    reasoning_steps=reasoning_steps,
+                )
+
             # Load response prompt from configuration
             if self.config is None:
                 self.config = load_agent_config("operations")
@@ -1036,15 +1180,18 @@ Return only valid JSON.""",
             # Use slightly higher temperature for more natural language (0.3 instead of default 0.2)
             # This balances consistency with natural, fluent language
             response = await self.nim_client.generate_response(
-                response_prompt, 
-                temperature=0.3
+                response_prompt,
+                temperature=0.25,
+                max_tokens=900,
+                max_retries=1,
             )
 
             # Parse JSON response
             try:
-                response_data = json.loads(response.content)
+                raw_content = response.content if isinstance(response.content, str) else ""
+                response_data = json.loads(raw_content) if raw_content else {}
                 logger.info(f"Successfully parsed LLM response: {response_data}")
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"Failed to parse LLM response as JSON: {e}")
                 logger.warning(f"Raw LLM response: {response.content}")
                 
@@ -1061,76 +1208,19 @@ Return only valid JSON.""",
                 else:
                     response_data = None
                 
-                # If still no valid JSON, generate natural language from tool results using LLM
+                # If still no valid JSON, synthesize response directly from tool results.
                 if response_data is None:
-                    logger.info(f"Generating natural language response from tool results: {len(successful_results)} successful, {len(failed_results)} failed")
-                    
-                    # Use LLM to generate natural language from tool results
+                    logger.info(f"Synthesizing deterministic response from tool results: {len(successful_results)} successful, {len(failed_results)} failed")
+
                     if successful_results:
-                        # Prepare tool results summary for LLM
-                        tool_results_summary = []
-                        for tool_id, result in successful_results.items():
-                            tool_name = result.get("tool_name", tool_id)
-                            tool_result = result.get("result", {})
-                            tool_results_summary.append({
-                                "tool": tool_name,
-                                "result": tool_result
-                            })
-                        
-                        # Ask LLM to generate natural language response
-                        natural_lang_prompt = [
-                            {
-                                "role": "system",
-                                "content": """You are a warehouse operations expert. Generate a clear, natural, conversational response 
-that explains what was accomplished based on tool execution results. Write in a professional but friendly tone, 
-as if explaining to a colleague. Use complete sentences, vary your sentence structure, and make it sound natural and fluent."""
-                            },
-                            {
-                                "role": "user",
-                                "content": f"""The user asked: "{query.user_query}"
-
-The following tools were executed successfully:
-{json.dumps(tool_results_summary, indent=2, default=str)[:1500]}
-
-Generate a natural, conversational response (2-4 sentences) that:
-1. Confirms what was accomplished
-2. Includes specific details (IDs, names, statuses) naturally woven into the explanation
-3. Sounds like a human expert explaining the results
-4. Is clear, professional, and easy to read
-
-Return ONLY the natural language response text (no JSON, no formatting, just the response)."""
-                            }
-                        ]
-                        
-                        try:
-                            natural_lang_response = await self.nim_client.generate_response(
-                                natural_lang_prompt,
-                                temperature=0.4  # Slightly higher for more natural language
-                            )
-                            natural_language = natural_lang_response.content.strip()
-                            logger.info(f"Generated natural language from LLM: {natural_language[:200]}...")
-                        except Exception as e:
-                            logger.warning(f"Failed to generate natural language from LLM: {e}, using fallback")
-                            # Fallback to structured summary
-                            summaries = []
-                            for tool_id, result in successful_results.items():
-                                tool_name = result.get("tool_name", tool_id)
-                                tool_result = result.get("result", {})
-                                if isinstance(tool_result, dict):
-                                    if "wave_id" in tool_result:
-                                        summaries.append(f"I've created wave {tool_result['wave_id']} for orders {', '.join(map(str, tool_result.get('order_ids', [])))} in {tool_result.get('zone', 'the specified zone')}.")
-                                    elif "task_id" in tool_result:
-                                        summaries.append(f"I've created task {tool_result['task_id']} of type {tool_result.get('task_type', 'unknown')}.")
-                                    elif "equipment_id" in tool_result:
-                                        summaries.append(f"I've dispatched {tool_result.get('equipment_id')} to {tool_result.get('zone', 'the specified location')} for {tool_result.get('task_type', 'operations')}.")
-                                    else:
-                                        summaries.append(f"I've successfully executed {tool_name}.")
-                                else:
-                                    summaries.append(f"I've successfully executed {tool_name}.")
-                            
-                            natural_language = " ".join(summaries) if summaries else "I've completed your request successfully."
+                        synthesized = self._build_fast_tool_result_summary(
+                            query=query,
+                            successful_results=successful_results,
+                            failed_results=failed_results,
+                        )
+                        natural_language = synthesized or "I completed the requested warehouse operations actions successfully."
                     else:
-                        # No successful results - use the raw LLM response if it looks reasonable
+                        # No successful results - use raw LLM text when available
                         if response.content and len(response.content.strip()) > 50:
                             natural_language = response.content.strip()
                         else:
@@ -1224,36 +1314,6 @@ Return ONLY the natural language response text (no JSON, no formatting, just the
                 response_data["confidence"] = calculated_confidence
             
             logger.info(f"Final confidence: {response_data['confidence']:.2f} (LLM: {current_confidence:.2f}, Calculated: {calculated_confidence:.2f})")
-            
-            # If natural language is too short or seems incomplete, enhance it
-            if natural_language and len(natural_language.strip()) < 50:
-                logger.warning(f"Natural language seems too short ({len(natural_language)} chars), attempting enhancement")
-                # Try to enhance with LLM
-                try:
-                    enhance_prompt = [
-                        {
-                            "role": "system",
-                            "content": "You are a warehouse operations expert. Expand and improve the given response to make it more natural, detailed, and conversational while keeping the same meaning."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"""Original response: "{natural_language}"
-
-User query: "{query.user_query}"
-
-Tool results: {len(successful_results)} tools executed successfully
-
-Expand this into a natural, conversational response (2-4 sentences) that explains what was accomplished in a clear, professional tone. Return ONLY the enhanced response text."""
-                        }
-                    ]
-                    enhanced_response = await self.nim_client.generate_response(
-                        enhance_prompt,
-                        temperature=0.4
-                    )
-                    natural_language = enhanced_response.content.strip()
-                    logger.info(f"Enhanced natural language: {natural_language[:200]}...")
-                except Exception as e:
-                    logger.warning(f"Failed to enhance natural language: {e}")
             
             # Validate response quality
             try:

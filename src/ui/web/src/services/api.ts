@@ -319,7 +319,7 @@ export const chatAPI = {
     const isComplexQuery = complexKeywords.some(keyword => messageLower.includes(keyword)) || 
                           request.message.split(' ').length > 15;
     
-    let timeout = 60000; // Default 60s
+    let timeout = 120000; // Default 120s to avoid premature timeout on non-reasoning equipment flows
     if (request.enable_reasoning) {
       timeout = isComplexQuery ? 240000 : 120000; // 240s (4min) for complex reasoning, 120s for regular reasoning
     } else if (isComplexQuery) {

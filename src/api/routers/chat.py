@@ -20,6 +20,7 @@ import logging
 import asyncio
 import re
 import time
+import os
 from src.api.graphs.mcp_integrated_planner_graph import get_mcp_planner_graph
 from src.api.services.guardrails.guardrails_service import guardrails_service
 from src.api.services.evidence.evidence_integration import (
@@ -46,6 +47,15 @@ router = APIRouter(prefix="/api/v1", tags=["Chat"])
 
 # Alias for backward compatibility
 _sanitize_log_data = sanitize_log_data
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer env vars safely with fallback default."""
+    raw = os.getenv(name, str(default)).split("#")[0].strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _get_confidence_indicator(confidence: float) -> str:
@@ -517,6 +527,29 @@ def _create_fallback_chat_response(
     )
 
 
+def _create_error_chat_response(
+    reply: str,
+    error_message: str,
+    error_type: str,
+    session_id: str,
+    confidence: float = 0.0,
+) -> ChatResponse:
+    """Create standardized error ChatResponse payload."""
+    return ChatResponse(
+        reply=reply,
+        route="error",
+        intent="error",
+        session_id=session_id,
+        structured_data={
+            "error": error_message,
+            "error_type": error_type,
+        },
+        recommendations=["Please try again", "Rephrase your question if needed"],
+        confidence=confidence,
+        actions_taken=[],
+    )
+
+
 def _create_safety_violation_response(
     violations: List[str],
     confidence: float,
@@ -710,16 +743,17 @@ async def chat(req: ChatRequest):
         ]) or len(req.message.split()) > 15
         
         if req.enable_reasoning:
-            # Very complex queries with reasoning need up to 4 minutes
-            # Set to 230s (slightly less than frontend 240s) to ensure backend responds before frontend times out
-            # Complex queries like "Analyze the relationship between..." can take longer
-            # For non-complex reasoning queries, set to 115s (slightly less than frontend 120s)
-            MAIN_QUERY_TIMEOUT = 230 if is_complex_query else 115  # 230s for complex, 115s for regular reasoning
+            MAIN_QUERY_TIMEOUT = (
+                _env_int("MAIN_QUERY_TIMEOUT_REASONING_COMPLEX", 300)
+                if is_complex_query
+                else _env_int("MAIN_QUERY_TIMEOUT_REASONING", 240)
+            )
         else:
-            # Regular queries: Increased timeouts to prevent premature timeouts
-            # Simple queries: 60s (was 30s) - allows time for LLM processing
-            # Complex queries: 90s (was 60s) - allows time for complex analysis
-            MAIN_QUERY_TIMEOUT = 90 if is_complex_query else 60
+            MAIN_QUERY_TIMEOUT = (
+                _env_int("MAIN_QUERY_TIMEOUT_COMPLEX", 180)
+                if is_complex_query
+                else _env_int("MAIN_QUERY_TIMEOUT_SIMPLE", 130)
+            )
         
         # Initialize result to None to avoid UnboundLocalError
         result = None

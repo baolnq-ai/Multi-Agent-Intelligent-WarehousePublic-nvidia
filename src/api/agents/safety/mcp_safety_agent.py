@@ -369,11 +369,17 @@ Return only valid JSON.""",
                 },
             ]
 
-            response = await self.nim_client.generate_response(parse_prompt, temperature=0.0)
+            response = await self.nim_client.generate_response(
+                parse_prompt,
+                temperature=0.0,
+                max_tokens=300,
+                max_retries=1,
+            )
 
             # Parse JSON response
             try:
-                parsed_data = json.loads(response.content)
+                raw_content = response.content if isinstance(response.content, str) else ""
+                parsed_data = json.loads(raw_content) if raw_content else {}
             except json.JSONDecodeError:
                 # Fallback parsing with keyword extraction
                 parsed_data = self._fallback_parse_safety_query(query)
@@ -404,9 +410,49 @@ Return only valid JSON.""",
 
         except Exception as e:
             logger.error(f"Error parsing safety query: {e}")
+            fallback_entities = self._fallback_parse_safety_query(query)
+            if not fallback_entities.get("description"):
+                fallback_entities["description"] = query
+            if not fallback_entities.get("reporter"):
+                fallback_entities["reporter"] = "user"
             return MCPSafetyQuery(
-                intent="incident_reporting", entities={}, context={}, user_query=query
+                intent="incident_reporting", entities=fallback_entities, context=context or {}, user_query=query
             )
+
+    def _build_fast_safety_summary(
+        self,
+        query: MCPSafetyQuery,
+        successful_results: Dict[str, Any],
+        failed_results: Dict[str, Any],
+    ) -> Optional[str]:
+        """Build a direct summary from safety tool results to avoid slow LLM synthesis."""
+        if not successful_results and not failed_results:
+            return None
+
+        lines: List[str] = []
+        for result_data in successful_results.values():
+            tool_name = result_data.get("tool_name", "")
+            result = result_data.get("result", {})
+
+            if tool_name == "get_safety_procedures":
+                lines.append("Retrieved relevant safety procedures for the requested situation.")
+            elif tool_name == "log_incident":
+                if isinstance(result, dict) and result.get("incident"):
+                    lines.append("A safety incident has been logged successfully.")
+                else:
+                    lines.append("Incident reporting action completed.")
+            elif tool_name == "broadcast_alert":
+                lines.append("A safety alert was broadcast to the target zone/channels.")
+            elif tool_name == "start_checklist":
+                lines.append("A safety checklist has been started for follow-up actions.")
+
+        if not lines and successful_results:
+            lines.append(f"Completed {len(successful_results)} safety tool action(s) successfully.")
+
+        if failed_results:
+            lines.append(f"{len(failed_results)} safety action(s) did not complete and may need a retry.")
+
+        return " ".join(lines)
 
     async def _discover_relevant_tools(
         self, query: MCPSafetyQuery
@@ -821,6 +867,51 @@ Return only valid JSON.""",
             failed_results = {
                 k: v for k, v in tool_results.items() if not v.get("success", False)
             }
+
+            # Fast synthesis path to keep safety responses within strict timeout budgets.
+            fast_summary = self._build_fast_safety_summary(
+                query=query,
+                successful_results=successful_results,
+                failed_results=failed_results,
+            )
+            if fast_summary:
+                total_tools = len(tool_results)
+                successful_count = len(successful_results)
+                success_rate = (successful_count / total_tools) if total_tools else 0.0
+                confidence = 0.95 if success_rate == 1.0 else (0.75 + (success_rate * 0.2))
+
+                reasoning_steps = None
+                if reasoning_chain:
+                    reasoning_steps = [
+                        {
+                            "step_id": step.step_id,
+                            "step_type": step.step_type,
+                            "description": step.description,
+                            "reasoning": step.reasoning,
+                            "confidence": step.confidence,
+                        }
+                        for step in reasoning_chain.steps
+                    ]
+
+                return MCPSafetyResponse(
+                    response_type="safety_info",
+                    data={"results": successful_results, "failed": failed_results},
+                    natural_language=fast_summary,
+                    recommendations=[] if not failed_results else ["Review failed safety actions and retry if required."],
+                    confidence=confidence,
+                    actions_taken=[
+                        {
+                            "action": result_data.get("tool_name", tool_id),
+                            "status": "success" if result_data.get("success") else "failed",
+                            "details": result_data.get("result", {}) if result_data.get("success") else result_data.get("error", ""),
+                        }
+                        for tool_id, result_data in tool_results.items()
+                    ],
+                    mcp_tools_used=list(successful_results.keys()),
+                    tool_execution_results=tool_results,
+                    reasoning_chain=reasoning_chain,
+                    reasoning_steps=reasoning_steps,
+                )
 
             # Load response prompt from configuration
             if self.config is None:

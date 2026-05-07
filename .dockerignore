@@ -193,7 +193,6 @@ setup.py
 setup.cfg
 MANIFEST.in
 requirements*.txt
-!requirements.txt
 !requirements.docker.txt
 
 # Celery

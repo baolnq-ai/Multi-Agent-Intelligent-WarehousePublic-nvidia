@@ -357,8 +357,9 @@ class MCPEquipmentAssetOperationsAgent:
                 any(indicator in query_lower for indicator in simple_query_indicators) and
                 len(query.split()) < 15  # Short queries
             )
+            has_direct_equipment_reference = bool(entities.get("equipment_id")) and len(query.split()) <= 8
             
-            if is_simple_query and entities:
+            if (is_simple_query and entities) or has_direct_equipment_reference:
                 logger.info(f"Using fast keyword-based parsing for simple query: {query[:50]}")
                 return MCPEquipmentQuery(
                     intent=intent,
@@ -396,11 +397,17 @@ Return only valid JSON.""",
                 },
             ]
 
-            response = await self.nim_client.generate_response(parse_prompt)
+            response = await self.nim_client.generate_response(
+                parse_prompt,
+                temperature=0.0,
+                max_tokens=300,
+                max_retries=1,
+            )
 
             # Parse JSON response
             try:
-                parsed_data = json.loads(response.content)
+                raw_content = response.content if isinstance(response.content, str) else ""
+                parsed_data = json.loads(raw_content) if raw_content else {}
             except json.JSONDecodeError:
                 # Fallback parsing
                 parsed_data = {
@@ -495,6 +502,10 @@ Return only valid JSON.""",
         try:
             execution_plan = []
 
+            def _tool_matches(tool: DiscoveredTool, token: str) -> bool:
+                token_lower = token.lower()
+                return token_lower in tool.tool_id.lower() or token_lower in tool.name.lower()
+
             # Create execution steps based on query intent
             # If no specific intent matches, default to equipment_lookup
             # Also handle variations like "equipment" as intent
@@ -510,7 +521,24 @@ Return only valid JSON.""",
                 if not equipment_tools and tools:
                     logger.warning(f"No EQUIPMENT category tools found, using any available tools: {[t.tool_id for t in tools[:3]]}")
                     equipment_tools = tools[:3]
-                for tool in equipment_tools[:3]:  # Limit to 3 tools
+
+                selected_tools: List[DiscoveredTool] = []
+                if query.entities.get("equipment_id"):
+                    # For direct equipment-id lookups, prioritize status/maintenance reads.
+                    preferred_tokens = ["status", "maintenance", "utilization"]
+                    for token in preferred_tokens:
+                        matches = [t for t in equipment_tools if _tool_matches(t, token) and t not in selected_tools]
+                        selected_tools.extend(matches[:1])
+                else:
+                    preferred_tokens = ["status", "utilization"]
+                    for token in preferred_tokens:
+                        matches = [t for t in equipment_tools if _tool_matches(t, token) and t not in selected_tools]
+                        selected_tools.extend(matches[:1])
+
+                if not selected_tools:
+                    selected_tools = equipment_tools[:2]
+
+                for tool in selected_tools[:3]:
                     execution_plan.append(
                         {
                             "tool_id": tool.tool_id,
@@ -996,7 +1024,8 @@ ABSOLUTELY CRITICAL:
             response = await self.nim_client.generate_response(
                 response_prompt,
                 temperature=0.0,  # Lower temperature for more consistent JSON format
-                max_tokens=2000  # Allow more tokens for detailed responses
+                max_tokens=900,
+                max_retries=1,
             )
 
             # Parse JSON response - try to extract JSON from response if it contains extra text
@@ -1122,80 +1151,10 @@ ABSOLUTELY CRITICAL:
             
             # If natural_language is missing, ask LLM to generate it from the response data
             if not natural_language or natural_language.strip() == "":
-                logger.warning("LLM did not return natural_language field. Requesting LLM to generate it from the response data.")
-                
-                # Also include response_data
-                data_for_generation = response_data.copy()
-                
-                # Ask LLM to generate natural_language from the equipment data
-                generation_prompt = [
-                    {
-                        "role": "system",
-                        "content": """You are a certified equipment and asset operations expert. 
-Generate a comprehensive, expert-level natural language response based on the provided equipment data.
-
-CRITICAL: Write in a clear, natural, conversational tone:
-- Use fluent, natural English that reads like a human expert speaking
-- Avoid robotic or template-like language
-- Be specific and detailed, but keep it readable
-- Use active voice when possible
-- Vary sentence structure for better readability
-- Make it sound like you're explaining to a colleague, not a machine
-- Include context and reasoning, not just facts
-- Write complete, well-formed sentences and paragraphs
-
-CRITICAL ANTI-ECHOING RULES - YOU MUST FOLLOW THESE:
-- NEVER start with phrases like "You asked", "You requested", "I'll", "Let me", "As you requested", "Here's what you asked for"
-- NEVER echo or repeat the user's query - start directly with the information or action result
-- Start with the actual information or what was accomplished (e.g., "I found 3 forklifts..." or "FL-01 is available...")
-- Write as if explaining to a colleague, not referencing the query
-- DO NOT say "Here's the response:" or "Here's what I found:" - just provide the information directly
-
-Your response must be detailed, informative, and directly answer the user's query WITHOUT echoing it.
-Include specific equipment details (asset IDs, statuses, zones, models, etc.) naturally woven into the explanation.
-Provide expert-level analysis of equipment availability, utilization, and recommendations."""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""The user asked: "{query.user_query}"
-
-The system retrieved the following equipment data:
-{json.dumps(equipment_data_summary, indent=2, default=str)[:2000]}
-
-Response data structure:
-{json.dumps(data_for_generation, indent=2, default=str)[:1000]}
-
-Tool execution results summary:
-{len(successful_results)} tools executed successfully
-
-Generate a comprehensive, expert-level natural language response that:
-1. Directly answers the user's query about equipment status and availability WITHOUT echoing the query
-2. Starts immediately with the information (e.g., "I found 3 forklifts..." or "FL-01 is available...")
-3. NEVER starts with "You asked", "You requested", "I'll", "Let me", "Here's the response", etc.
-4. Includes specific details from the equipment data (asset IDs, statuses, zones, models) naturally woven into the explanation
-5. Provides expert analysis of equipment availability and utilization with context
-6. Offers actionable recommendations based on the equipment status
-7. Is written in a clear, natural, conversational tone - like explaining to a colleague
-8. Uses varied sentence structure and flows naturally
-9. Is comprehensive but concise (typically 2-4 well-formed paragraphs)
-
-Write in a way that sounds natural and human, not robotic or template-like. Return ONLY the natural language response text (no JSON, no formatting, just the response text)."""
-                    }
-                ]
-                
-                try:
-                    generation_response = await self.nim_client.generate_response(
-                        generation_prompt,
-                        temperature=0.4,  # Higher temperature for more natural, fluent language
-                        max_tokens=1000
-                    )
-                    natural_language = generation_response.content.strip()
-                    logger.info(f"LLM generated natural_language: {natural_language[:200]}...")
-                except Exception as e:
-                    logger.error(f"Failed to generate natural_language from LLM: {e}", exc_info=True)
-                    # If LLM generation fails, we still need to provide a response
-                    # This is a fallback, but we should log the error for debugging
-                    natural_language = f"I've processed your equipment query: {sanitize_prompt_input(query.user_query)}. Please review the structured data for details."
+                logger.warning("LLM response missing natural_language; using cleaned primary response text")
+                natural_language = self._remove_tool_execution_results_safely(response.content or "").strip()
+                if not natural_language:
+                    natural_language = f"Processed equipment query: {sanitize_prompt_input(query.user_query)}"
             
             # Populate data field with equipment information
             data = response_data.get("data", {})
@@ -1216,89 +1175,11 @@ Write in a way that sounds natural and human, not robotic or template-like. Retu
                 # Always include tool_results in data
                 if successful_results:
                     data["tool_results"] = successful_results
-            
+
             # Generate recommendations if missing - ask LLM to generate them
             if not recommendations or (isinstance(recommendations, list) and len(recommendations) == 0):
-                logger.info("LLM did not return recommendations. Requesting LLM to generate expert recommendations.")
-                
-                # Ask LLM to generate recommendations based on the query and equipment data
-                recommendations_prompt = [
-                    {
-                        "role": "system",
-                        "content": """You are a certified equipment and asset operations expert. 
-Generate actionable, expert-level recommendations based on the user's query and equipment data.
-Recommendations should be specific, practical, and based on equipment management best practices."""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""The user asked: "{query.user_query}"
-Query intent: {query.intent}
-Query entities: {json.dumps(query.entities, default=str)}
-
-Equipment data:
-{json.dumps(equipment_data_summary, indent=2, default=str)[:1500]}
-
-Response data:
-{json.dumps(response_data, indent=2, default=str)[:1000]}
-
-Generate 3-5 actionable, expert-level recommendations that:
-1. Are specific to the user's query and the equipment data
-2. Follow equipment management best practices
-3. Are practical and implementable
-4. Address equipment availability, utilization, maintenance, or assignment needs
-
-Return ONLY a JSON array of recommendation strings, for example:
-["Recommendation 1", "Recommendation 2", "Recommendation 3"]
-
-Do not include any other text, just the JSON array."""
-                    }
-                ]
-                
-                try:
-                    rec_response = await self.nim_client.generate_response(
-                        recommendations_prompt,
-                        temperature=0.3,
-                        max_tokens=500
-                    )
-                    rec_text = rec_response.content.strip()
-                    # Try to extract JSON array - use bounded pattern to avoid quadratic runtime
-                    # Find first '[' and last ']' to extract JSON array safely
-                    start_idx = rec_text.find('[')
-                    if start_idx != -1:
-                        # Find matching ']' by counting brackets (safe, no backtracking)
-                        bracket_count = 1
-                        end_idx = start_idx + 1
-                        while end_idx < len(rec_text) and bracket_count > 0:
-                            if rec_text[end_idx] == '[':
-                                bracket_count += 1
-                            elif rec_text[end_idx] == ']':
-                                bracket_count -= 1
-                            end_idx += 1
-                        
-                        if bracket_count == 0:
-                            # Found matching brackets, extract JSON array
-                            json_str = rec_text[start_idx:end_idx]
-                            try:
-                                recommendations = json.loads(json_str)
-                            except json.JSONDecodeError:
-                                recommendations = None
-                        else:
-                            recommendations = None
-                    else:
-                        recommendations = None
-                    
-                    if recommendations:
-                        # Successfully parsed JSON array
-                        pass
-                    else:
-                        # Fallback: split by lines if not JSON
-                        recommendations = [line.strip() for line in rec_text.split('\n') if line.strip() and (line.strip().startswith('-') or line.strip().startswith('•'))]
-                        if not recommendations:
-                            recommendations = [rec_text]
-                    logger.info(f"LLM generated {len(recommendations)} recommendations")
-                except Exception as e:
-                    logger.error(f"Failed to generate recommendations from LLM: {e}", exc_info=True)
-                    recommendations = []  # Empty rather than hardcoded
+                logger.info("LLM response missing recommendations; continuing without extra LLM recommendation pass")
+                recommendations = []
             
             # Validate response quality
             try:

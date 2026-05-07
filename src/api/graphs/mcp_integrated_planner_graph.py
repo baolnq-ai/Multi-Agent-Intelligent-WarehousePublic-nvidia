@@ -35,6 +35,7 @@ from dataclasses import asdict
 import logging
 import asyncio
 import threading
+import os
 
 from src.api.services.mcp.tool_discovery import ToolDiscoveryService
 from src.api.services.mcp.tool_binding import ToolBindingService
@@ -48,9 +49,9 @@ logger = logging.getLogger(__name__)
 
 # Constants for agent timeouts
 AGENT_INIT_TIMEOUT = 5.0  # 5 seconds for agent initialization
-AGENT_TIMEOUT_REASONING = 90.0  # 90s for reasoning queries
-AGENT_TIMEOUT_COMPLEX = 50.0  # 50s for complex queries
-AGENT_TIMEOUT_SIMPLE = 45.0  # 45s for simple queries
+AGENT_TIMEOUT_REASONING = float(os.getenv("AGENT_TIMEOUT_REASONING", "210"))  # 210s for reasoning queries
+AGENT_TIMEOUT_COMPLEX = float(os.getenv("AGENT_TIMEOUT_COMPLEX", "140"))  # 140s for complex queries
+AGENT_TIMEOUT_SIMPLE = float(os.getenv("AGENT_TIMEOUT_SIMPLE", "110"))  # 110s for simple queries
 
 # Constants for complex query detection
 COMPLEX_QUERY_KEYWORDS = [
@@ -83,6 +84,56 @@ def _detect_complex_query(message_text: str) -> bool:
         (message_lower.count(" and ") > 0 and any(action in message_lower for action in COMPLEX_QUERY_ACTIONS)) or
         len(message_text.split()) > COMPLEX_QUERY_WORD_COUNT_THRESHOLD
     )
+
+
+def _is_small_talk_message(message_text: str) -> bool:
+    """Detect short greeting/small-talk messages that should use the general route."""
+    normalized = " ".join(message_text.lower().strip().split())
+    normalized = normalized.strip(".,!?;:")
+
+    # Keep operational queries out of the small-talk path.
+    domain_terms = {
+        "agv", "amr", "forklift", "equipment", "inventory", "stock", "sku",
+        "task", "wave", "order", "safety", "incident", "document", "maintenance",
+        "utilization", "dispatch", "assign", "status", "zone"
+    }
+    if any(term in normalized for term in domain_terms):
+        return False
+
+    greeting_phrases = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "xin chao",
+        "xin chào",
+        "chao",
+        "chào",
+        "alo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+
+    greeting_prefixes = [
+        "hi",
+        "hello",
+        "hey",
+        "xin chao",
+        "xin chào",
+        "chao",
+        "chào",
+    ]
+
+    if normalized in greeting_phrases:
+        return True
+
+    # Accept short greeting phrases like "chào bạn", "hello team".
+    word_count = len(normalized.split())
+    if word_count <= 4 and any(normalized.startswith(prefix + " ") for prefix in greeting_prefixes):
+        return True
+
+    return False
 
 
 def _calculate_agent_timeout(enable_reasoning: bool, is_complex_query: bool) -> float:
@@ -720,6 +771,14 @@ class MCPPlannerGraph:
             if not message_text:
                 state["user_intent"] = "general"
                 state["routing_decision"] = "general"
+                return state
+
+            # Short greeting/small-talk should avoid domain-specific heavy pipelines.
+            if _is_small_talk_message(message_text):
+                state["user_intent"] = "general"
+                state["routing_decision"] = "general"
+                state["routing_confidence"] = 0.95
+                logger.info("Small-talk detected; routing to general")
                 return state
 
             # Use MCP-enhanced intent classification (keyword-based)
@@ -1548,12 +1607,9 @@ class MCPPlannerGraph:
             ]) or len(message.split()) > 15
             
             if enable_reasoning:
-                # Very complex queries with reasoning need up to 4 minutes
-                # Match the timeout in chat.py: 230s for complex, 115s for regular reasoning
-                graph_timeout = 230.0 if is_complex_query else 115.0  # 230s for complex, 115s for regular reasoning
+                graph_timeout = float(os.getenv("GRAPH_TIMEOUT_REASONING_COMPLEX", "300")) if is_complex_query else float(os.getenv("GRAPH_TIMEOUT_REASONING", "240"))
             else:
-                # Regular queries: Match chat.py timeouts (60s for simple, 90s for complex)
-                graph_timeout = 90.0 if is_complex_query else 60.0  # Increased from 30s to 60s for simple queries
+                graph_timeout = float(os.getenv("GRAPH_TIMEOUT_COMPLEX", "180")) if is_complex_query else float(os.getenv("GRAPH_TIMEOUT_SIMPLE", "130"))
             logger.info(f"Graph timeout set to {graph_timeout}s (complex: {is_complex_query}, reasoning: {enable_reasoning})")
             try:
                 result = await asyncio.wait_for(
