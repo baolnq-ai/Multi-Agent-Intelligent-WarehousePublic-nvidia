@@ -2,4 +2,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/scripts/stop.sh" "$@"
+TARGET_SCRIPT="$SCRIPT_DIR/scripts/stop.sh"
+
+if [[ ! -f "$TARGET_SCRIPT" ]]; then
+	echo "ERROR: missing stop script: $TARGET_SCRIPT" >&2
+	exit 1
+fi
+
+if [[ ! -x "$TARGET_SCRIPT" ]]; then
+	chmod +x "$TARGET_SCRIPT" 2>/dev/null || true
+fi
+
+echo "[stop] Stopping project services from repository root..."
+exec "$TARGET_SCRIPT" "$@"
