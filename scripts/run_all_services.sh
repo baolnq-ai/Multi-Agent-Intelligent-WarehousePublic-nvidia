@@ -36,25 +36,80 @@ source <(sed 's/\r$//' "$COMPOSE_ENV_FILE")
 source <(sed 's/\r$//' "$ROOT_ENV_FILE")
 set +a
 
-required_ports=(5435 6379 9092 2379 9003 9004 19531 9094 8001 3001 3002)
+declare -A selected_ports=()
 
 is_port_in_use() {
 	local port="$1"
 	ss -ltn | awk '{print $4}' | grep -Eq "(^|:)${port}$"
 }
 
-assert_ports_available() {
-	local busy=()
-	for port in "${required_ports[@]}"; do
-		if is_port_in_use "$port"; then
-			busy+=("$port")
+find_available_port() {
+	local start_port="$1"
+	local max_port=$((start_port + 200))
+	local candidate="$start_port"
+
+	while [[ "$candidate" -le "$max_port" ]]; do
+		if ! is_port_in_use "$candidate" && [[ -z "${selected_ports[$candidate]:-}" ]]; then
+			echo "$candidate"
+			return 0
 		fi
+		candidate=$((candidate + 1))
 	done
 
-	if [[ ${#busy[@]} -gt 0 ]]; then
-		echo "ERROR: Required ports are already in use: ${busy[*]}"
-		echo "Stop conflicting processes or containers, then re-run setup.sh"
-		exit 1
+	echo "ERROR: Unable to find an available port near ${start_port}" >&2
+	return 1
+}
+
+resolve_host_port() {
+	local var_name="$1"
+	local default_port="$2"
+	local configured_port="${!var_name:-$default_port}"
+
+	if [[ ! "$configured_port" =~ ^[0-9]+$ ]]; then
+		configured_port="$default_port"
+	fi
+
+	local resolved_port="$configured_port"
+	if is_port_in_use "$configured_port" || [[ -n "${selected_ports[$configured_port]:-}" ]]; then
+		resolved_port="$(find_available_port "$default_port")"
+		echo "Port ${configured_port} is busy, using ${resolved_port} for ${var_name}"
+	fi
+
+	export "${var_name}=${resolved_port}"
+	selected_ports["$resolved_port"]=1
+}
+
+resolve_runtime_ports() {
+	resolve_host_port HOST_POSTGRES_PORT 5435
+	resolve_host_port HOST_REDIS_PORT 6379
+	resolve_host_port HOST_KAFKA_PORT 9092
+	resolve_host_port HOST_ETCD_PORT 2379
+	resolve_host_port HOST_MINIO_PORT 9003
+	resolve_host_port HOST_MINIO_CONSOLE_PORT 9004
+	resolve_host_port HOST_MILVUS_GRPC_PORT 19531
+	resolve_host_port HOST_MILVUS_HTTP_PORT 9094
+	resolve_host_port HOST_BACKEND_PORT 8001
+	resolve_host_port HOST_FRONTEND_PORT 3001
+	resolve_host_port HOST_NGINX_PORT 3002
+
+	if [[ "${RUN_LLM_NIM:-false}" == "true" ]]; then
+		resolve_host_port LLM_NIM_PORT 8000
+	fi
+
+	echo "Resolved host ports:"
+	echo "  PostgreSQL: ${HOST_POSTGRES_PORT}"
+	echo "  Redis:      ${HOST_REDIS_PORT}"
+	echo "  Kafka:      ${HOST_KAFKA_PORT}"
+	echo "  Etcd:       ${HOST_ETCD_PORT}"
+	echo "  MinIO API:  ${HOST_MINIO_PORT}"
+	echo "  MinIO UI:   ${HOST_MINIO_CONSOLE_PORT}"
+	echo "  Milvus gRPC:${HOST_MILVUS_GRPC_PORT}"
+	echo "  Milvus HTTP:${HOST_MILVUS_HTTP_PORT}"
+	echo "  Backend:    ${HOST_BACKEND_PORT}"
+	echo "  Frontend:   ${HOST_FRONTEND_PORT}"
+	echo "  Nginx:      ${HOST_NGINX_PORT}"
+	if [[ "${RUN_LLM_NIM:-false}" == "true" ]]; then
+		echo "  LLM NIM:    ${LLM_NIM_PORT}"
 	fi
 }
 
@@ -65,7 +120,7 @@ for c in wosa-timescaledb wosa-redis wosa-kafka wosa-etcd wosa-minio wosa-milvus
 	docker rm -f "$c" >/dev/null 2>&1 || true
 done
 
-assert_ports_available
+resolve_runtime_ports
 
 services=(timescaledb redis kafka etcd minio milvus backend frontend nginx)
 if [[ "${RUN_LLM_NIM:-false}" == "true" ]]; then
@@ -131,9 +186,9 @@ wait_http() {
 	return 1
 }
 
-wait_http "http://localhost:8001/api/v1/health" "backend health"
-wait_http "http://localhost:3001" "frontend"
-wait_http "http://localhost:3002" "nginx"
+wait_http "http://localhost:${HOST_BACKEND_PORT}/api/v1/health" "backend health"
+wait_http "http://localhost:${HOST_FRONTEND_PORT}" "frontend"
+wait_http "http://localhost:${HOST_NGINX_PORT}" "nginx"
 
 echo "Ensuring default users exist..."
 "${COMPOSE[@]}" --env-file "$COMPOSE_ENV_FILE" -f "$COMPOSE_FILE" exec -T backend python - <<'PY'
@@ -184,14 +239,14 @@ PY
 
 echo "Running smoke checks..."
 LOGIN_PAYLOAD='{"username":"admin","password":"changeme"}'
-LOGIN_RESPONSE="$(curl -sS -X POST "http://localhost:8001/api/v1/auth/login" -H "Content-Type: application/json" -d "$LOGIN_PAYLOAD" || true)"
+LOGIN_RESPONSE="$(curl -sS -X POST "http://localhost:${HOST_BACKEND_PORT}/api/v1/auth/login" -H "Content-Type: application/json" -d "$LOGIN_PAYLOAD" || true)"
 if ! echo "$LOGIN_RESPONSE" | grep -q '"access_token"'; then
 	echo "ERROR: auth login failed"
 	echo "Response: $LOGIN_RESPONSE"
 	exit 1
 fi
 
-CHAT_RESPONSE="$(curl -sS -m 30 -X POST "http://localhost:3002/api/v1/chat" -H "Content-Type: application/json" -d '{"message":"chào bạn","session_id":"setup-smoke","enable_reasoning":false}' || true)"
+CHAT_RESPONSE="$(curl -sS -m 30 -X POST "http://localhost:${HOST_NGINX_PORT}/api/v1/chat" -H "Content-Type: application/json" -d '{"message":"chào bạn","session_id":"setup-smoke","enable_reasoning":false}' || true)"
 if ! echo "$CHAT_RESPONSE" | grep -q '"reply"'; then
 	echo "ERROR: chat smoke test failed"
 	echo "Response: $CHAT_RESPONSE"
@@ -200,7 +255,7 @@ fi
 
 echo
 echo "All services are up and smoke checks passed."
-echo "  Frontend direct: http://localhost:3001"
-echo "  Nginx gateway:   http://localhost:3002"
-echo "  Backend API:     http://localhost:8001"
-echo "  API docs:        http://localhost:8001/docs"
+echo "  Frontend direct: http://localhost:${HOST_FRONTEND_PORT}"
+echo "  Nginx gateway:   http://localhost:${HOST_NGINX_PORT}"
+echo "  Backend API:     http://localhost:${HOST_BACKEND_PORT}"
+echo "  API docs:        http://localhost:${HOST_BACKEND_PORT}/docs"
