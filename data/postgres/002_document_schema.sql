@@ -134,9 +134,18 @@ END;
 $$ language 'plpgsql';
 
 -- Add updated_at triggers
-CREATE TRIGGER update_documents_updated_at 
-    BEFORE UPDATE ON documents 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'update_documents_updated_at'
+    ) THEN
+        CREATE TRIGGER update_documents_updated_at
+            BEFORE UPDATE ON documents
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+END $$;
 
 -- Add comments for documentation
 COMMENT ON TABLE documents IS 'Stores uploaded documents and their metadata';

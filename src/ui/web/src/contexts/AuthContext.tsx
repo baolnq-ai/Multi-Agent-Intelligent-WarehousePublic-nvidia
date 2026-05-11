@@ -41,7 +41,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     if (token) {
       // Verify token and get user info
       // Use longer timeout for token verification (might be slow on first load)
-      api.get('/api/v1/auth/me', {
+      api.get('/auth/me', {
         timeout: 30000, // 30 second timeout
       })
         .then(response => {
