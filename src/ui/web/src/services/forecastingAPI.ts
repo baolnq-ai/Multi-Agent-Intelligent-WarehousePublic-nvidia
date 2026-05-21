@@ -1,7 +1,9 @@
 import axios from 'axios';
 
-// Use relative URL to leverage proxy middleware
-const API_BASE_URL = process.env.REACT_APP_API_URL || '/api/v1';
+// Use the same-origin proxy for browser calls. The compose dev env may expose
+// REACT_APP_API_URL as localhost, which can resolve to IPv6 on Windows while
+// the backend is bound to 127.0.0.1. Keeping this relative avoids that split.
+const API_BASE_URL = '/api/v1';
 
 // Create axios instance with proper timeout settings
 const api = axios.create({
