@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    ports: ["${HOST_POSTGRES_PORT:-5435}:5432"]
+    ports: ["${HOST_POSTGRES_PORT:-6000}:5432"]
     volumes:
       - ./data/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -18,7 +18,7 @@ services:
   redis:
     image: redis:7
     container_name: wosa-redis
-    ports: ["${HOST_REDIS_PORT:-6379}:6379"]
+    ports: ["${HOST_REDIS_PORT:-6001}:6379"]
 
   kafka:
     image: apache/kafka:3.7.0
@@ -38,7 +38,7 @@ services:
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
       - KAFKA_LOG_DIRS=/tmp/kraft-combined-logs
       - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
-    ports: ["${HOST_KAFKA_PORT:-9092}:9092"]
+    ports: ["${HOST_KAFKA_PORT:-6002}:9092"]
     volumes:
       - kafka_data:/tmp/kraft-combined-logs
     command:
@@ -63,7 +63,7 @@ services:
       - ETCD_ELECTION_TIMEOUT=2500
       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
-    ports: ["${HOST_ETCD_PORT:-2379}:2379"]
+    ports: ["${HOST_ETCD_PORT:-6003}:2379"]
 
   minio:
     image: minio/minio:RELEASE.2024-03-15T01-07-19Z
@@ -73,8 +73,8 @@ services:
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
     command: server /data --console-address ":9001"
     ports:
-      - "${HOST_MINIO_PORT:-9003}:9000"
-      - "${HOST_MINIO_CONSOLE_PORT:-9004}:9001"
+      - "${HOST_MINIO_PORT:-6004}:9000"
+      - "${HOST_MINIO_CONSOLE_PORT:-6005}:9001"
 
   milvus:
     image: milvusdb/milvus:v2.4.3
@@ -87,8 +87,8 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_USE_SSL: "false"
     ports:
-      - "${HOST_MILVUS_GRPC_PORT:-19531}:19530"   # gRPC
-      - "${HOST_MILVUS_HTTP_PORT:-9094}:9091"     # HTTP
+      - "${HOST_MILVUS_GRPC_PORT:-6006}:19530"   # gRPC
+      - "${HOST_MILVUS_HTTP_PORT:-6007}:9091"     # HTTP
     depends_on: [etcd, minio]
 
   # Backend API Service
@@ -98,7 +98,7 @@ services:
       dockerfile: Dockerfile.backend
     container_name: wosa-backend
     ports:
-      - "127.0.0.1:${HOST_BACKEND_PORT:-8001}:8001"
+      - "127.0.0.1:${HOST_BACKEND_PORT:-6008}:8001"
     environment:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -143,9 +143,9 @@ services:
       dockerfile: Dockerfile.frontend
     container_name: wosa-frontend
     ports:
-      - "${HOST_FRONTEND_PORT:-3001}:3001"
+      - "${HOST_FRONTEND_PORT:-6009}:3001"
     environment:
-      - REACT_APP_API_URL=http://localhost:${HOST_BACKEND_PORT:-8001}
+      - REACT_APP_API_URL=http://localhost:${HOST_BACKEND_PORT:-6008}
       - REACT_APP_API_PROXY_TARGET=http://backend:8001
       - PORT=3001
       - HOST=0.0.0.0
@@ -164,7 +164,7 @@ services:
     image: nginx:1.25.3-alpine
     container_name: wosa-nginx
     ports:
-      - "${HOST_NGINX_PORT:-3002}:80"
+      - "${HOST_NGINX_PORT:-6010}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -177,7 +177,7 @@ services:
     image: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5:latest
     container_name: wosa-llm-nim
     ports:
-      - "${LLM_NIM_PORT:-8000}:8000"
+      - "${LLM_NIM_PORT:-6011}:8000"
     environment:
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
       - CUDA_VISIBLE_DEVICES=0,1,2,3

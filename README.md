@@ -105,15 +105,17 @@ cp .env.example deploy/compose/.env
 ./scripts/run_all_services.sh
 ```
 
-After the script succeeds, the main entrypoints are:
+AI Hub installs keep host ports inside `6000-6050`. After the script succeeds, the main entrypoints are:
 
 | Endpoint | Default URL |
 | --- | --- |
-| Frontend | `http://localhost:3001` |
-| Nginx gateway | `http://localhost:3002` |
-| Backend API | `http://localhost:8001` |
-| API docs | `http://localhost:8001/docs` |
-| Metrics | `http://localhost:8001/api/v1/metrics` |
+| Frontend | `http://localhost:6009` |
+| Nginx gateway | `http://localhost:6010` |
+| Backend API | `http://localhost:6008` |
+| API docs | `http://localhost:6008/docs` |
+| Metrics | `http://localhost:6008/api/v1/metrics` |
+
+The compose infra defaults are PostgreSQL `6000`, Redis `6001`, Kafka `6002`, etcd `6003`, MinIO API `6004`, MinIO console `6005`, Milvus gRPC `6006` and Milvus HTTP `6007`. If a port is busy, `scripts/run_all_services.sh` searches the same `6000-6050` range.
 
 Default seeded credentials are `admin / changeme` and `user / changeme` unless overridden in environment variables.
 

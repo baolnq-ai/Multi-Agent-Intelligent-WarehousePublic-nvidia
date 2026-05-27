@@ -66,7 +66,7 @@ PY
 
 find_available_port() {
 	local start_port="$1"
-	local max_port=$((start_port + 200))
+	local max_port=6050
 	local candidate="$start_port"
 
 	while [[ "$candidate" -le "$max_port" ]]; do
@@ -77,7 +77,7 @@ find_available_port() {
 		candidate=$((candidate + 1))
 	done
 
-	echo "ERROR: Unable to find an available port near ${start_port}" >&2
+	echo "ERROR: Unable to find an available port in AI Hub range 6000-6050 near ${start_port}" >&2
 	return 1
 }
 
@@ -87,6 +87,9 @@ resolve_host_port() {
 	local configured_port="${!var_name:-$default_port}"
 
 	if [[ ! "$configured_port" =~ ^[0-9]+$ ]]; then
+		configured_port="$default_port"
+	fi
+	if [[ "$configured_port" -lt 6000 || "$configured_port" -gt 6050 ]]; then
 		configured_port="$default_port"
 	fi
 
@@ -101,20 +104,20 @@ resolve_host_port() {
 }
 
 resolve_runtime_ports() {
-	resolve_host_port HOST_POSTGRES_PORT 5435
-	resolve_host_port HOST_REDIS_PORT 6379
-	resolve_host_port HOST_KAFKA_PORT 9092
-	resolve_host_port HOST_ETCD_PORT 2379
-	resolve_host_port HOST_MINIO_PORT 9003
-	resolve_host_port HOST_MINIO_CONSOLE_PORT 9004
-	resolve_host_port HOST_MILVUS_GRPC_PORT 19531
-	resolve_host_port HOST_MILVUS_HTTP_PORT 9094
-	resolve_host_port HOST_BACKEND_PORT 8001
-	resolve_host_port HOST_FRONTEND_PORT 3001
-	resolve_host_port HOST_NGINX_PORT 3002
+	resolve_host_port HOST_POSTGRES_PORT 6000
+	resolve_host_port HOST_REDIS_PORT 6001
+	resolve_host_port HOST_KAFKA_PORT 6002
+	resolve_host_port HOST_ETCD_PORT 6003
+	resolve_host_port HOST_MINIO_PORT 6004
+	resolve_host_port HOST_MINIO_CONSOLE_PORT 6005
+	resolve_host_port HOST_MILVUS_GRPC_PORT 6006
+	resolve_host_port HOST_MILVUS_HTTP_PORT 6007
+	resolve_host_port HOST_BACKEND_PORT 6008
+	resolve_host_port HOST_FRONTEND_PORT 6009
+	resolve_host_port HOST_NGINX_PORT 6010
 
 	if [[ "${RUN_LLM_NIM:-false}" == "true" ]]; then
-		resolve_host_port LLM_NIM_PORT 8000
+		resolve_host_port LLM_NIM_PORT 6011
 	fi
 
 	echo "Resolved host ports:"
